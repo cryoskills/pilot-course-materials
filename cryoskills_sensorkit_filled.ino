@@ -3,11 +3,14 @@
 #include <DS18B20.h>  // open-source library for using the DS temperature sensor: https://github.com/matmunk/DS18B20
 #include <SPI.h> 
 #include <SD.h>  // for logging data to the SD card (SPI and SD are both included in the standard Arduino setup)
-
+#include <RH_RF95.h>
 /*
 Code for running the cryoskills sensor kit: taking temperature measurements using a DS18B20 digital probe, and PS1000 analog probe.
 Full version, no gap-filling needed!
 */ 
+
+// set this to your unique device ID
+#define DEVICE_ID 0xc501;
 
 // let's declare some functions for stuff we need to do in the script
 float_t get_ds_temp();   //get a digital temperature reading, return it as a float
@@ -15,13 +18,20 @@ float_t get_adc_temp();  // get an analog temperature reading, return it as a fl
 void setup_sd();   //set up the SD card to log data to a file
 void write_to_sd();  // write data to file
 void take_measurements();  //this will wrap up all of the measurements and logging in one function, for neatness
+void radio_setup();
+void radio_loop();
 
 #define cardSelect 4  // set the pin used by the SD card
+
+uint8_t data_packet[6];
+uint16_t instrument_id;
 
 File logfile;  // file for logging data to
 
 // initialise probe object
 DS18B20 ds(5); //nb this uses the 'Arduino name' of the pin (D5)
+// intialise radio object
+RH_RF95 rf95(10, 9); // Adafruit Feather M0 with RFM95
 
 // initialise variables that we'll use later
 float_t ds_temp; // reading from the DS probe
@@ -46,10 +56,12 @@ void setup() {
   cryo_configure_clock();
   cryo_add_alarm_every(5, take_measurements);
   Serial.begin(115200); //open serial connection
-  //while(!Serial); // this forces the program to wait until the serial monitor is ready, so we don't miss anything
+  Serial1.begin(9600); //open serial connection
+  while(!Serial); // this forces the program to wait until the serial monitor is ready, so we don't miss anything
   adc.begin(); //use the cryo_adc library to initialise our probe
-  pinMode(6, OUTPUT); //set pin 6 to output current to our circuit
+  pinMode(11, OUTPUT); //set pin 6 to output current to our circuit
   setup_sd();
+  radio_setup();
 }
 
 // this is our main loop, which will run repeatedly. We need to wake our cryo-child up, check for alarms, then send him back to sleep.
@@ -57,10 +69,13 @@ void loop() {
   cryo_wakeup_debug();  // use cryo_wakeup_debug() for testing, and cryo_wakeup() for deployment.
   cryo_raise_alarms();  // 
   cryo_sleep_debug();  //ditto, use debug mode for testing
+  radio_loop();
 }
 
 // this is where the business happens: we need to take measurements, and then write them to the SD card by calling our other functions.
 void take_measurements(){
+  Serial.println("taking digital measurement!");
+  Serial1.println("taking digital measurement!");
   ds_temp = get_ds_temp();
   adc_temp = get_adc_temp();
   write_to_sd();
@@ -78,15 +93,15 @@ float_t get_ds_temp(){
 }
 
 float_t get_adc_temp(){
-   digitalWrite(6, HIGH); //switch pin 6 on, so we have the voltage from the controller across our circuit 
+   digitalWrite(11, HIGH); //switch pin 6 on, so we have the voltage from the controller across our circuit 
   // enable adc to take measurement
   adc.enable();
-  delay(50); // leave some time for things to happen
+  delay(100); // leave some time for things to happen
   // take reading
   adc_reading = adc.read();
   // disable adc
   adc.disable();
-  digitalWrite(6, LOW); //switch pin 6 off again
+  //digitalWrite(6, LOW); //switch pin 6 off again
   // convert reading to voltage
   // the range of readings is from 0 to 32768, and the range of voltages we can measure is 0 to 1
   adc_voltage = (adc_reading/32768.*1);
@@ -101,7 +116,7 @@ float_t get_adc_temp(){
   V_2 = V_in*(R_3/(R_3+R_1));  // find V_2 using the voltage division rule
   V_1 = V_2+adc_voltage/8; // find V_1 using our adc voltage (which is the difference between V_1 and V_2)
   adc_resistance = (V_1*R_1)/(V_in-V_1); //also using voltage division rule, and rearranging for the resistance we want
-  adc_temp = (adc_resistance-1000)/3.86;  //convert from resistance to temperature using the calibration curve. Think about how best to approximate this relationship (there are a few ways!)
+  adc_temp = (adc_resistance-999.97)/3.8621;  //convert from resistance to temperature using the calibration curve. Think about how best to approximate this relationship (there are a few ways!)
 
   // finally, print out our temperature value! 
   Serial.print("Analog probe:");
@@ -137,10 +152,9 @@ void setup_sd() {
 
   //write a header
   logfile.println("Temperature data from Cryoskills sensor kit, degrees C");
-  logfile.println("Digital probe\tAnalog probe");
+  logfile.println("Time\tDigital probe\tAnalog probe");
 
   //set the output pins
-  pinMode(13, OUTPUT);
   pinMode(8, OUTPUT);
   Serial.println("Ready!");
 }
@@ -168,8 +182,82 @@ void write_to_sd() {
   logfile.println();
   logfile.flush();
   digitalWrite(8, LOW);
+
+
   
 // delay to make sure everything goes smoothly
   delay(100);
 }
+void radio_setup() 
+{
+    // reset
+//  pinMode(11,OUTPUT);
+//  digitalWrite(11, HIGH);
+//  delay(1);
+//  pinMode(11,OUTPUT);
+//  digitalWrite(11, LOW);
+//  delay(1);
+//  pinMode(11,OUTPUT);
+//  digitalWrite(11, HIGH);
+  instrument_id = DEVICE_ID;
+  
+  Serial.begin(9600);
+  while (!Serial) ; // Wait for serial port to be available
+  if (!rf95.init())
+    Serial.println("init failed");
+  // Defaults after init are 434.0MHz, 13dBm, Bw = 125 kHz, Cr = 4/5, Sf = 128chips/symbol, CRC on
+ 
+  // You can change the modulation parameters with eg
+  // rf95.setModemConfig(RH_RF95::Bw500Cr45Sf128);
+  
+  // The default transmitter power is 13dBm, using PA_BOOST.
+  // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then 
+  // you can set transmitter powers from 2 to 20 dBm:
+//  rf95.setTxPower(20, false);
+  // If you are using Modtronix inAir4 or inAir9, or any other module which uses the
+  // transmitter RFO pins and not the PA_BOOST pins
+  // then you can configure the power transmitter power for 0 to 15 dBm and with useRFO true. 
+  // Failure to do that will result in extremely low transmit powers.
+//  rf95.setTxPower(14, true);
+}
+ 
+void radio_loop()
+{
+  // package up instrument ID and temperature value to send
+  memcpy(data_packet, &instrument_id, 2);
+  memcpy(data_packet+2, &ds_temp, 4);
 
+  
+  Serial.println("Sending to rf95_server");
+  // Send a message to rf95_server
+  //uint8_t data[] = "Hello World!";
+  //rf95.send(data, sizeof(data));
+  Serial.printf("%x,%x,%x,%x,%x,%x,\n", data_packet[0], data_packet[1],data_packet[2],data_packet[3],data_packet[4],data_packet[5]);
+  rf95.send(data_packet, sizeof(data_packet));
+  
+  rf95.waitPacketSent();
+  // Now wait for a reply
+  uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];
+  uint8_t len = sizeof(buf);
+ 
+  if (rf95.waitAvailableTimeout(3000))
+  { 
+    // Should be a reply message for us now   
+    if (rf95.recv(buf, &len))
+   {
+      Serial.print("got reply: ");
+      Serial.println((char*)buf);
+//      Serial.print("RSSI: ");
+//      Serial.println(rf95.lastRssi(), DEC);    
+    }
+    else
+    {
+      Serial.println("recv failed");
+    }
+  }
+  else
+  {
+    Serial.println("No reply, is rf95_server running?");
+  }
+  delay(400);
+}
